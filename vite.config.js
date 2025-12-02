@@ -10,6 +10,9 @@ export default defineConfig({
     vue(),
     vueDevTools(),
   ],
+
+  base: process.env.BASE_PATH || '/',  // Dynamic base for GH Pages; defaults to '/' for local
+  
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))

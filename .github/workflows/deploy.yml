@@ -1,33 +1,30 @@
 name: Deploy to GitHub Pages
 
-# Controls when the action will run.
-# For example, running on push to the main branch
 on:
   push:
     branches: [ "main" ]
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This job builds the frontend and deploys it to GitHub Pages
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      # Checks-out your repository into the workspace
       - name: Checkout
         uses: actions/checkout@v3
         with:
           persist-credentials: false
 
-      # Sets up Node.js environment
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: '20'
+          node-version: '18'
 
-      # Installs project dependencies
       - name: Install Dependencies
         run: npm install
+
+      - name: Set Dynamic Base Path
+        run: |
+          REPO_NAME=$(basename ${{ github.repository }})
+          echo "BASE_PATH=/$REPO_NAME/" >> $GITHUB_ENV  # Sets env var for vite.config.js
 
       # Builds the project
       - name: Build Project
@@ -38,5 +35,4 @@ jobs:
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.PRONGHORN_ACTIONS_TOKEN }}
-
           publish_dir: ./dist
