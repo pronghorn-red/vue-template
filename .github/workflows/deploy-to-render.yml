@@ -1,4 +1,4 @@
-name: Deploy to Render (Fully Automated – pronghorn- prefix)
+name: Deploy to Render (pronghorn- prefix – Blueprint Sync)
 
 on:
   push:
@@ -9,7 +9,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # Needed to commit render.yaml temporarily
+      contents: write  # For committing render.yaml
 
     steps:
       - name: Checkout code
@@ -33,17 +33,15 @@ jobs:
           echo "SERVICE_NAME=$SERVICE_NAME" >> $GITHUB_ENV
           echo "Target URL: https://$SERVICE_NAME.onrender.com"
 
-      - name: Create/Update render.yaml Blueprint + Deploy
-        env:
-          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      - name: Create render.yaml Blueprint & Sync
         run: |
           set -e
 
-          # 1. Build the render.yaml content with correct name + Vue SPA rewrite
-          cat > render.yaml << 'EOF'
+          # 1. Generate render.yaml with dynamic name + Vue Router rewrite
+          cat > render.yaml << EOF
           services:
             - type: web
-              name: ${{ env.SERVICE_NAME }}
+              name: $SERVICE_NAME
               runtime: static
               region: oregon
               branch: main
@@ -52,7 +50,7 @@ jobs:
               buildCommand: npm install && npm run build
               staticPublishPath: dist
 
-              # Vue Router history mode → always serve index.html
+              # Vue Router history mode → serve index.html for all paths
               routes:
                 - type: rewrite
                   source: /*
@@ -62,28 +60,18 @@ jobs:
               autoDeployTrigger: commit
           EOF
 
-          # 2. Commit render.yaml (triggers Blueprint sync)
+          # 2. Commit & push (triggers Render Blueprint sync automatically)
           git config user.name "github-actions[bot]"
           git config user.email "github-actions@github.com"
           git add render.yaml
-          git commit -m "chore: update render.yaml – auto-deploy $(date)" || echo "No changes to commit"
-          git push origin main
-
-          # 3. Trigger immediate deploy via Render Blueprint API (fastest feedback)
-          echo "Triggering Render Blueprint deploy..."
-          RESPONSE=$(curl -s -X POST \
-            -H "Authorization: Bearer $RENDER_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d '{}' \
-            https://api.render.com/deploy)
-
-          DEPLOY_ID=$(echo "$RESPONSE" | jq -r '.id // empty')
-          if [ -n "$DEPLOY_ID" ] && [ "$DEPLOY_ID" != "null" ]; then
-            echo "Deploy triggered → $DEPLOY_ID"
-            echo "Dashboard: https://dashboard.render.com"
+          if git diff --staged --quiet; then
+            echo "No changes to render.yaml – skipping commit"
           else
-            echo "Deploy API response:"
-            echo "$RESPONSE" | jq .
+            git commit -m "chore: sync render.yaml blueprint – $(date +%Y-%m-%d)"
+            git push origin main
+            echo "✅ Pushed render.yaml – Render will sync & deploy in ~1-2 min"
           fi
 
-          echo "All done! Your site will be live at https://${{ env.SERVICE_NAME }}.onrender.com in ~1–2 min"
+          echo "All set! First run: Render creates site. Subsequent: Overwrites dist/."
+          echo "Monitor at: https://dashboard.render.com"
+          echo "Live URL: https://$SERVICE_NAME.onrender.com"
