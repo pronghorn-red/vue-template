@@ -1,4 +1,4 @@
-name: Deploy to Render
+name: Deploy to Render (pronghorn- prefix)
 
 on:
   push:
@@ -21,136 +21,117 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install & Build
+      - name: Install & Build (validation)
         run: |
           npm ci
           npm run build
 
-      - name: Extract Repository Name
+      - name: Set Render Service Name (pronghorn- + repo name)
         run: |
           REPO_NAME=$(basename ${{ github.repository }})
+          SERVICE_NAME="pronghorn-$REPO_NAME"
           echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
+          echo "RENDER_SERVICE_NAME=$SERVICE_NAME" >> $GITHUB_ENV
+          echo "Will deploy to → https://$SERVICE_NAME.onrender.com"
 
-      - name: Deploy to Render.com
+      - name: Deploy to Render
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
         run: |
-          set -e  # Exit on any error
+          set -e
 
-          # Curl wrapper for API calls
+          SERVICE_NAME="${{ env.RENDER_SERVICE_NAME }}"
+          echo "Target service: $SERVICE_NAME"
+
           api() {
-            local method="${1:-GET}"
-            local url="$2"
-            local extra_headers="$3"
-            local data="$4"
-            curl -fsS -X "$method" \
+            curl -fsS -w "%{http_code}" -X "$1" \
               -H "Authorization: Bearer $RENDER_API_KEY" \
               -H "Accept: application/json" \
               -H "Content-Type: application/json" \
-              $extra_headers \
-              $url \
-              $data
+              "$2" \
+              ${3:+-d "$3"} || echo "000"
           }
 
-          SERVICE_NAME="${{ env.REPO_NAME }}"
-          echo "Target Render service name: $SERVICE_NAME"
-
-          # === 1. List ALL services and find by name ===
-          echo "Fetching all services to check for existing..."
-          SERVICES=$(api "https://api.render.com/v1/services?limit=100")
-          EXISTING_ID=$(echo "$SERVICES" | jq -r --arg name "$SERVICE_NAME" '.[] | select(.name == $name) | .id // empty')
-
-          if [ -z "$EXISTING_ID" ] || [ "$EXISTING_ID" = "null" ]; then
-            echo "No existing service found. Creating new static site..."
-
-            # Build create payload with jq (no heredoc!)
-            CREATE_JSON=$(jq -n \
-              --arg name "$SERVICE_NAME" \
-              --arg repo "https://github.com/${{ github.repository }}.git" \
-              '{
-                name: $name,
-                type: "static_site",
-                region: "oregon",
-                branch: "main",
-                repo: $repo,
-                buildCommand: "npm install && npm run build",
-                publishPath: "dist",
-                autoDeploy: true
-              }')
-
-            RESPONSE=$(api POST "https://api.render.com/v1/services" "" "-d $CREATE_JSON")
-            SERVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
-
-            if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
-              echo "Failed to create service. Full response:"
-              echo "$RESPONSE" | jq .
-              exit 1
-            fi
-
-            echo "Created new static site → ID: $SERVICE_ID"
-          else
-            SERVICE_ID="$EXISTING_ID"
-            echo "Found existing service → ID: $SERVICE_ID"
-          fi
-
-          # === 2. Add SPA rewrite rule for Vue Router ===
-          echo "Configuring SPA routing (/* → /index.html)..."
-          # Build update payload with jq
-          UPDATE_JSON=$(jq -n \
+          # 1. Try to create the service
+          echo "Attempting to create static site '$SERVICE_NAME'..."
+          CREATE_JSON=$(jq -n \
+            --arg name "$SERVICE_NAME" \
+            --arg repo "https://github.com/${{ github.repository }}.git" \
             '{
-              staticSite: {
-                rewriteRules: [
-                  {
-                    source: "/*",
-                    destination: "/index.html",
-                    statusCode: 200
-                  }
-                ]
-              }
+              name: $name,
+              type: "static_site",
+              region: "oregon",
+              branch: "main",
+              repo: $repo,
+              buildCommand: "npm install && npm run build",
+              publishPath: "dist",
+              autoDeploy: true
             }')
 
-          api PATCH "https://api.render.com/v1/services/$SERVICE_ID" "" "-d $UPDATE_JSON" > /dev/null || echo "Rewrite update completed (or unchanged)."
+          RESPONSE=$(api POST "https://api.render.com/v1/services" "$CREATE_JSON")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
 
-          # === 3. Trigger deploy ===
-          echo "Triggering deploy..."
-          DEPLOY=$(api POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" "" "-d {}")
-          DEPLOY_ID=$(echo "$DEPLOY" | jq -r '.id // empty')
+          SERVICE_ID=$(echo "$BODY" | jq -r '.id // empty')
 
-          if [ -z "$DEPLOY_ID" ]; then
-            echo "Failed to trigger deploy. Response: $DEPLOY"
-            exit 1
+          if [[ "$HTTP_CODE" == "201" && -n "$SERVICE_ID" && "$SERVICE_ID" != "null" ]]; then
+            echo "Created new service → $SERVICE_ID"
+          else
+            echo "Service probably exists (HTTP $HTTP_CODE). Searching by name..."
+            
+            # 2. Paginated search until we find it
+            cursor=""
+            while true; do
+              url="https://api.render.com/v1/services"
+              [[ -n "$cursor" ]] && url="$url?cursor=$cursor"
+              
+              PAGE=$(api GET "$url")
+              PAGE_BODY=$(echo "$PAGE" | sed '$d')
+              SERVICE_ID=$(echo "$PAGE_BODY" | jq -r --arg n "$SERVICE_NAME" '.[]? | select(.name == $n) | .id // empty')
+              
+              if [[ -n "$SERVICE_ID" && "$SERVICE_ID" != "null" ]]; then
+                echo "Found existing service → $SERVICE_ID"
+                break
+              fi
+              
+              cursor=$(echo "$PAGE_BODY" | jq -r '.next // empty')
+              [[ -z "$cursor" ]] && { echo "Service not found after full scan"; exit 1; }
+              echo "Next page..."
+            done
           fi
 
-          echo "Deploy started → ID: $DEPLOY_ID"
-          echo "Dashboard: https://dashboard.render.com/static/$SERVICE_ID"
+          # 3. Ensure Vue Router SPA rewrite
+          echo "Setting SPA routing rule..."
+          jq -n '{
+            staticSite: {
+              rewriteRules: [{
+                source: "/*",
+                destination: "/index.html",
+                statusCode: 200
+              }]
+            }
+          }' | api PATCH "https://api.render.com/v1/services/$SERVICE_ID" - > /dev/null
 
-          # === 4. Poll for deploy status ===
-          echo "Waiting for deploy to complete (max ~10 min)..."
+          # 4. Trigger deploy
+          echo "Triggering deploy..."
+          DEPLOY=$(api POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" "{}")
+          DEPLOY_BODY=$(echo "$DEPLOY" | sed '$d')
+          DEPLOY_ID=$(echo "$DEPLOY_BODY" | jq -r '.id')
+
+          echo "Deploy started → $DEPLOY_ID"
+          echo "Dashboard → https://dashboard.render.com/static/$SERVICE_ID"
+
+          # 5. Wait for live
           for i in {1..40}; do
             sleep 15
-            STATUS_RESPONSE=$(api "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID")
-            STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status // "unknown"')
-            echo "Deploy $i/40: $STATUS"
-
-            case "$STATUS" in
-              "live")
-                echo "✅ Deploy successful!"
-                echo "Live URL: https://$SERVICE_NAME.onrender.com"
-                exit 0
-                ;;
-              "failed"|"build_failed"|"canceled")
-                echo "❌ Deploy failed! Check logs in Render dashboard."
-                echo "Details: $(echo "$STATUS_RESPONSE" | jq .)"
-                exit 1
-                ;;
-              "pending"|"in_progress")
-                # Continue waiting
-                ;;
-              *)
-                echo "Unknown status: $STATUS - continuing..."
-                ;;
-            esac
+            STATUS=$(api GET "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID" | sed '$d' | jq -r '.status')
+            echo "[$i/40] Status: $STATUS"
+            [[ "$STATUS" == "live" ]] && {
+              echo "LIVE → https://$SERVICE_NAME.onrender.com"
+              exit 0
+            }
+            [[ "$STATUS" == "failed" || "$STATUS" == "build_failed" ]] && exit 1
           done
 
-          echo "⏰ Timeout: Deploy not finished in 10 min. Check dashboard."
+          echo "Timeout — check Render dashboard"
           exit 1
