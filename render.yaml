@@ -9,7 +9,7 @@ services:
     buildCommand: npm install && npm run build
     staticPublishPath: dist
 
-    # Vue Router history mode → always serve index.html
+    # Vue Router history mode → serve index.html for all paths
     routes:
       - type: rewrite
         source: /*
