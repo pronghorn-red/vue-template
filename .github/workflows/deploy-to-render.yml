@@ -1,0 +1,132 @@
+name: Deploy to Render
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (just to validate locally)
+        run: npm run build
+
+      - name: Extract repo name & set Render service name
+        run: |
+          REPO_NAME=$(basename ${{ github.repository }})
+          echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
+          echo "RENDER_SERVICE_NAME=$REPO_NAME" >> $GITHUB_ENV
+
+      - name: Create or Deploy to Render Static Site
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          # Helper: curl wrapper
+          api() {
+            curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
+                 -H "Accept: application/json" \
+                 -H "Content-Type: application/json" \
+                 "$@"
+          }
+
+          SERVICE_NAME="$REPO_NAME"
+
+          echo "Looking for existing Render service named: $SERVICE_NAME"
+
+          # Search for existing service by name
+          EXISTING=$(api "https://api.render.com/v1/services?name=$SERVICE_NAME" | jq -r '.[0].id // empty')
+
+          if [ -z "$EXISTING" ]; then
+            echo "No existing service found. Creating new Static Site..."
+
+            CREATE_PAYLOAD=$(cat <<EOF
+            {
+              "name": "$SERVICE_NAME",
+              "type": "static_site",
+              "region": "oregon",
+              "buildCommand": "npm install && npm run build",
+              "publishPath": "dist",
+              "branch": "main",
+              "repo": "https://github.com/${{ github.repository }}",
+              "autoDeploy": true
+            }
+            EOF
+            )
+
+            RESPONSE=$(api -X POST -d "$CREATE_PAYLOAD" https://api.render.com/v1/services)
+            SERVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
+
+            if [ "$SERVICE_ID" = "null" ] || [ -z "$SERVICE_ID" ]; then
+              echo "Failed to create service:"
+              echo "$RESPONSE" | jq .
+              exit 1
+            fi
+
+            echo "Created new static site: $SERVICE_ID"
+          else
+            SERVICE_ID="$EXISTING"
+            echo "Found existing service: $SERVICE_ID"
+          fi
+
+          # Ensure SPA routing is configured (critical for Vue Router history mode)
+          echo "Ensuring SPA rewrite rules are set..."
+          UPDATE_PAYLOAD=$(cat <<EOF
+          {
+            "staticSite": {
+              "rewriteRules": [
+                { "source": "/*", "destination": "/index.html", "statusCode": 200 }
+              ]
+            }
+          }
+          EOF
+          )
+
+          api -X PATCH -d "$UPDATE_PAYLOAD" "https://api.render.com/v1/services/$SERVICE_ID"
+
+          # Trigger deploy
+          echo "Triggering deploy..."
+          DEPLOY=$(api -X POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" -d '{}')
+          DEPLOY_ID=$(echo "$DEPLOY" | jq -r '.id')
+
+          echo "Deploy started: $DEPLOY_ID"
+          echo "https://dashboard.render.com/static/$SERVICE_ID"
+
+          # Wait for deploy to finish
+          echo "Waiting for deploy to go live..."
+          for i in {1..40}; do
+            sleep 15
+            STATUS=$(api "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID" | jq -r '.status')
+            echo "Deploy status: $STATUS"
+
+            if [ "$STATUS" = "live" ]; then
+              echo "Deploy successful!"
+              echo "Your site is live at: https://$SERVICE_NAME.onrender.com"
+              exit 0
+            fi
+
+            if [ "$STATUS" = "build_failed" ] || [ "$STATUS" = "failed" ]; then
+              echo "Deploy failed!"
+              exit 1
+            fi
+          done
+
+          echo "Timeout waiting for deploy"
+          exit 1
