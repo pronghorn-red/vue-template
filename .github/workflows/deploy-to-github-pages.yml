@@ -1,38 +1,176 @@
-name: Deploy to GitHub Pages
+name: Deploy to Render (pronghorn- prefix – API Integrated)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          persist-credentials: false
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
-      - name: Install Dependencies
-        run: npm install
+      - name: Install & Build Vue app
+        run: |
+          npm ci
+          npm run build
 
-      - name: Set Dynamic Base Path
+      - name: Generate pronghorn- service name
         run: |
           REPO_NAME=$(basename ${{ github.repository }})
-          echo "BASE_PATH=/$REPO_NAME/" >> $GITHUB_ENV  # Sets env var for vite.config.js
+          SERVICE_NAME="pronghorn-$REPO_NAME"
+          echo "SERVICE_NAME=$SERVICE_NAME" >> $GITHUB_ENV
+          echo "Target URL: https://$SERVICE_NAME.onrender.com"
 
-      # Builds the project
-      - name: Build Project
-        run: npm run build
+      - name: Create/Find Service & Deploy
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -e
 
-      # Deploys the build output to GitHub Pages
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.PRONGHORN_ACTIONS_TOKEN }}
-          publish_dir: ./dist
+          SERVICE_NAME="${{ env.SERVICE_NAME }}"
+          echo "Target service: $SERVICE_NAME"
+
+          # API helper (returns body)
+          api_body() {
+            local method="$1" url="$2" data="$3"
+            curl -fsS -X "$method" \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              "$url" \
+              ${data:+-d "$data"}
+          }
+
+          # HTTP code helper
+          http_code() {
+            local method="$1" url="$2" data="$3"
+            curl -fsS -w "%{http_code}" -o /dev/null -X "$method" \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H "Content-Type: application/json" \
+              "$url" \
+              ${data:+-d "$data"}
+          }
+
+          # 1. Try create static site (fixed payload from Render API docs)
+          echo "Attempting to create static site..."
+          CREATE_JSON=$(jq -n \
+            --arg name "$SERVICE_NAME" \
+            --arg repo "https://github.com/${{ github.repository }}.git" \
+            '{
+              name: $name,
+              type: "web",
+              runtime: "static",
+              region: "oregon",
+              branch: "main",
+              repo: $repo,
+              buildCommand: "npm install && npm run build",
+              publishPath: "dist",
+              autoDeploy: true
+            }')
+
+          CREATE_CODE=$(http_code POST "https://api.render.com/v1/services" "$CREATE_JSON")
+          if [[ "$CREATE_CODE" == "201" ]]; then
+            CREATE_BODY=$(api_body POST "https://api.render.com/v1/services" "$CREATE_JSON")
+            SERVICE_ID=$(echo "$CREATE_BODY" | jq -r '.id // empty')
+            echo "✅ Created new static site → ID: $SERVICE_ID"
+          else
+            echo "Create returned $CREATE_CODE (likely exists). Debug body:"
+            api_body POST "https://api.render.com/v1/services" "$CREATE_JSON" | jq . || echo "Empty response"
+            echo "Proceeding to search for existing service..."
+          fi
+
+          # 2. Search for service ID (paginated, stops on match)
+          echo "Searching for '$SERVICE_NAME'..."
+          cursor=""
+          SERVICE_ID=""
+          page=0
+          while [[ -z "$SERVICE_ID" || "$SERVICE_ID" == "null" ]]; do
+            ((page++))
+            search_url="https://api.render.com/v1/services"
+            [[ -n "$cursor" ]] && search_url="$search_url?cursor=$cursor"
+            echo "Scanning page $page..."
+
+            PAGE_BODY=$(api_body GET "$search_url")
+            PAGE_CODE=$(http_code GET "$search_url")
+
+            if [[ "$PAGE_CODE" != "200" ]]; then
+              echo "❌ Search failed (HTTP $PAGE_CODE). Check API key."
+              exit 1
+            fi
+
+            SERVICE_ID=$(echo "$PAGE_BODY" | jq -r --arg n "$SERVICE_NAME" '.[]? | select(.name == $n and .runtime == "static") | .id // empty')
+
+            if [[ -n "$SERVICE_ID" && "$SERVICE_ID" != "null" ]]; then
+              echo "✅ Found service → ID: $SERVICE_ID"
+              break
+            fi
+
+            cursor=$(echo "$PAGE_BODY" | jq -r '.next // empty')
+            [[ -z "$cursor" ]] && {
+              echo "❌ Service not found. Create manually in dashboard, then re-push."
+              exit 1
+            }
+          done
+
+          # 3. Apply Vue Router rewrite (SPA fallback)
+          echo "Applying rewrite rules..."
+          UPDATE_JSON=$(jq -n \
+            '{
+              staticSite: {
+                rewriteRules: [{
+                  source: "/*",
+                  destination: "/index.html",
+                  statusCode: 200
+                }]
+              }
+            }')
+          UPDATE_CODE=$(http_code PATCH "https://api.render.com/v1/services/$SERVICE_ID" "$UPDATE_JSON")
+          [[ "$UPDATE_CODE" == "200" ]] && echo "✅ Rewrites applied" || echo "Warning: Update returned $UPDATE_CODE (may be unchanged)"
+
+          # 4. Trigger deploy (overwrites via Git + build)
+          echo "Triggering deploy..."
+          DEPLOY_BODY=$(api_body POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" "{}")
+          DEPLOY_CODE=$(http_code POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" "{}")
+          if [[ "$DEPLOY_CODE" != "201" ]]; then
+            echo "❌ Deploy trigger failed (HTTP $DEPLOY_CODE). Response:"
+            echo "$DEPLOY_BODY" | jq .
+            exit 1
+          fi
+
+          DEPLOY_ID=$(echo "$DEPLOY_BODY" | jq -r '.id // empty')
+          echo "🚀 Deploy started → $DEPLOY_ID"
+          echo "Dashboard: https://dashboard.render.com/srv/$SERVICE_ID"
+
+          # 5. Poll until live
+          echo "Waiting for live (max 10 min)..."
+          for i in {1..40}; do
+            sleep 15
+            STATUS_BODY=$(api_body GET "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID")
+            STATUS=$(echo "$STATUS_BODY" | jq -r '.status // "unknown"')
+            echo "[$i/40] Status: $STATUS"
+
+            if [[ "$STATUS" == "live" ]]; then
+              echo "✅ SUCCESS! Live at https://$SERVICE_NAME.onrender.com"
+              exit 0
+            fi
+            if [[ "$STATUS" == "failed" || "$STATUS" == "build_failed" ]]; then
+              echo "❌ FAILED! Details:"
+              echo "$STATUS_BODY" | jq .
+              exit 1
+            fi
+          done
+
+          echo "⏰ Timeout. Check dashboard for logs."
+          exit 1
