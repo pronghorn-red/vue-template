@@ -1,4 +1,4 @@
-name: Deploy to Render (pronghorn- prefix)
+name: Deploy to Render (pronghorn- prefix - Fixed)
 
 on:
   push:
@@ -43,23 +43,44 @@ jobs:
           SERVICE_NAME="${{ env.RENDER_SERVICE_NAME }}"
           echo "Target service: $SERVICE_NAME"
 
+          # API helper: returns body on success, exits on 4xx/5xx, sets HTTP_CODE
           api() {
-            curl -fsS -w "%{http_code}" -X "$1" \
+            local method="$1"
+            local url="$2"
+            local data="$3"
+            local http_code
+            http_code=$(curl -fsS --write-out "%{http_code}" -X "$method" \
               -H "Authorization: Bearer $RENDER_API_KEY" \
               -H "Accept: application/json" \
               -H "Content-Type: application/json" \
-              "$2" \
-              ${3:+-d "$3"} || echo "000"
+              "$url" \
+              ${data:+-d "$data"} \
+              -o >(cat) 2>/dev/null || echo "000")
+            echo "$http_code"
           }
 
-          # 1. Try to create the service
+          # Body fetch helper (separate for responses)
+          api_body() {
+            local method="$1"
+            local url="$2"
+            local data="$3"
+            curl -fsS -X "$method" \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              "$url" \
+              ${data:+-d "$data"}
+          }
+
+          # 1. Try to create the service (correct payload for static site)
           echo "Attempting to create static site '$SERVICE_NAME'..."
           CREATE_JSON=$(jq -n \
             --arg name "$SERVICE_NAME" \
             --arg repo "https://github.com/${{ github.repository }}.git" \
             '{
               name: $name,
-              type: "static_site",
+              type: "web",
+              runtime: "static",
               region: "oregon",
               branch: "main",
               repo: $repo,
@@ -68,70 +89,95 @@ jobs:
               autoDeploy: true
             }')
 
-          RESPONSE=$(api POST "https://api.render.com/v1/services" "$CREATE_JSON")
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-
-          SERVICE_ID=$(echo "$BODY" | jq -r '.id // empty')
-
-          if [[ "$HTTP_CODE" == "201" && -n "$SERVICE_ID" && "$SERVICE_ID" != "null" ]]; then
-            echo "Created new service → $SERVICE_ID"
+          HTTP_CODE=$(api POST "https://api.render.com/v1/services" "$CREATE_JSON")
+          if [[ "$HTTP_CODE" == "201" ]]; then
+            SERVICE_ID=$(echo "$CREATE_JSON" | jq -r '.name')  # Temp; refetch below
+            echo "✅ Created new service (HTTP 201)"
+          elif [[ "$HTTP_CODE" == "409" ]]; then
+            echo "Service exists (HTTP 409) - searching for ID..."
+          elif [[ "$HTTP_CODE" == "400" ]]; then
+            echo "Create failed (HTTP 400 - likely exists or invalid payload). Searching anyway..."
+            echo "Debug response:" && api_body POST "https://api.render.com/v1/services" "$CREATE_JSON" | jq . || true
           else
-            echo "Service probably exists (HTTP $HTTP_CODE). Searching by name..."
-            
-            # 2. Paginated search until we find it
-            cursor=""
-            while true; do
-              url="https://api.render.com/v1/services"
-              [[ -n "$cursor" ]] && url="$url?cursor=$cursor"
-              
-              PAGE=$(api GET "$url")
-              PAGE_BODY=$(echo "$PAGE" | sed '$d')
-              SERVICE_ID=$(echo "$PAGE_BODY" | jq -r --arg n "$SERVICE_NAME" '.[]? | select(.name == $n) | .id // empty')
-              
-              if [[ -n "$SERVICE_ID" && "$SERVICE_ID" != "null" ]]; then
-                echo "Found existing service → $SERVICE_ID"
-                break
-              fi
-              
-              cursor=$(echo "$PAGE_BODY" | jq -r '.next // empty')
-              [[ -z "$cursor" ]] && { echo "Service not found after full scan"; exit 1; }
-              echo "Next page..."
-            done
+            echo "Unexpected create response (HTTP $HTTP_CODE). Debug:" && api_body POST "https://api.render.com/v1/services" "$CREATE_JSON" | jq . || true
+            exit 1
           fi
+
+          # 2. Always search for ID (paginated, stops on match)
+          echo "Searching for service ID..."
+          cursor=""
+          SERVICE_ID=""
+          page=0
+          while [[ -z "$SERVICE_ID" || "$SERVICE_ID" == "null" ]]; do
+            ((page++))
+            search_url="https://api.render.com/v1/services"
+            if [[ -n "$cursor" ]]; then
+              search_url="$search_url?cursor=$cursor"
+            fi
+            echo "Scanning page $page..."
+
+            PAGE_BODY=$(api_body GET "$search_url")
+            SERVICE_ID=$(echo "$PAGE_BODY" | jq -r --arg n "$SERVICE_NAME" '.[]? | select(.name == $n and .runtime == "static") | .id // empty')
+
+            if [[ -n "$SERVICE_ID" && "$SERVICE_ID" != "null" ]]; then
+              echo "✅ Found service → ID: $SERVICE_ID"
+              break
+            fi
+
+            cursor=$(echo "$PAGE_BODY" | jq -r '.next // empty')
+            if [[ -z "$cursor" ]]; then
+              echo "❌ Service '$SERVICE_NAME' not found after $page pages."
+              echo "Last page debug:" && echo "$PAGE_BODY" | jq . || true
+              exit 1
+            fi
+            echo "Continuing to next page..."
+          done
 
           # 3. Ensure Vue Router SPA rewrite
           echo "Setting SPA routing rule..."
-          jq -n '{
-            staticSite: {
-              rewriteRules: [{
-                source: "/*",
-                destination: "/index.html",
-                statusCode: 200
-              }]
-            }
-          }' | api PATCH "https://api.render.com/v1/services/$SERVICE_ID" - > /dev/null
+          UPDATE_JSON=$(jq -n \
+            '{
+              staticSite: {  # Note: Use web for patch too
+                rewriteRules: [{
+                  source: "/*",
+                  destination: "/index.html",
+                  statusCode: 200
+                }]
+              }
+            }')
+          PATCH_CODE=$(api PATCH "https://api.render.com/v1/services/$SERVICE_ID" "$UPDATE_JSON")
+          if [[ "$PATCH_CODE" != "200" ]]; then
+            echo "Warning: Rewrite update returned $PATCH_CODE (may be unchanged)"
+          fi
 
           # 4. Trigger deploy
           echo "Triggering deploy..."
-          DEPLOY=$(api POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" "{}")
-          DEPLOY_BODY=$(echo "$DEPLOY" | sed '$d')
-          DEPLOY_ID=$(echo "$DEPLOY_BODY" | jq -r '.id')
-
-          echo "Deploy started → $DEPLOY_ID"
-          echo "Dashboard → https://dashboard.render.com/static/$SERVICE_ID"
+          DEPLOY_BODY=$(api_body POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" "{}")
+          DEPLOY_ID=$(echo "$DEPLOY_BODY" | jq -r '.id // empty')
+          if [[ -z "$DEPLOY_ID" ]]; then
+            echo "❌ Failed to trigger deploy. Response:" && echo "$DEPLOY_BODY" | jq . || true
+            exit 1
+          fi
+          echo "🚀 Deploy started → $DEPLOY_ID"
+          echo "Dashboard → https://dashboard.render.com/srv/$SERVICE_ID"  # Use srv- for web/static
 
           # 5. Wait for live
+          echo "Waiting for deploy (max 10 min)..."
           for i in {1..40}; do
             sleep 15
-            STATUS=$(api GET "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID" | sed '$d' | jq -r '.status')
+            STATUS_BODY=$(api_body GET "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID")
+            STATUS=$(echo "$STATUS_BODY" | jq -r '.status // "unknown"')
             echo "[$i/40] Status: $STATUS"
-            [[ "$STATUS" == "live" ]] && {
-              echo "LIVE → https://$SERVICE_NAME.onrender.com"
+
+            if [[ "$STATUS" == "live" ]]; then
+              echo "✅ LIVE → https://$SERVICE_NAME.onrender.com"
               exit 0
-            }
-            [[ "$STATUS" == "failed" || "$STATUS" == "build_failed" ]] && exit 1
+            fi
+            if [[ "$STATUS" == "failed" || "$STATUS" == "build_failed" ]]; then
+              echo "❌ FAILED! Response:" && echo "$STATUS_BODY" | jq . || true
+              exit 1
+            fi
           done
 
-          echo "Timeout — check Render dashboard"
+          echo "⏰ Timeout — check Render dashboard"
           exit 1
